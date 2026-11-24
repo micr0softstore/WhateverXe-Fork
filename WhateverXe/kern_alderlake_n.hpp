@@ -129,6 +129,13 @@ struct DisplayReadout {
     Register registers[160] {};
 };
 
+inline bool value(const DisplayReadout &r, uint32_t offset, uint32_t &out) {
+    if (r.count > sizeof(r.registers) / sizeof(r.registers[0])) return false;
+    for (uint32_t i=0; i<r.count; ++i)
+        if (r.registers[i].offset==offset) { out=r.registers[i].value; return out!=UINT32_MAX; }
+    return false;
+}
+
 // Read only. Check Display 13 PW_A/B/C before pipe-local registers; do not
 // access TGL FIA/TC/Dekel addresses or issue selector/power/MMIO writes.
 template<class IO> void readDisplay(IO &io, bool admitted, DisplayReadout &r) {
@@ -190,6 +197,22 @@ template<class IO> void readDisplay(IO &io, bool admitted, DisplayReadout &r) {
         // Display13 DSC/joiner belongs to the corresponding pipe well.
         add(0x78000 + 0x200 * pipe);add(0x78004 + 0x200 * pipe);
     }
+    // CMTG is clocked by the active port. Check the same power, clock
+    // and buffer on both sides of the optional read, while they are live.
+    uint32_t trans=0,ctl2=0,clock=0,buffer=0;
+    if(r.status==ReadoutStatus::Complete && r.activePipes==1 &&
+       value(r,0x60404,ctl2) && ctl2==8 && value(r,0x60400,trans) &&
+       (trans&0xff000000U)==0x8a000000U && value(r,0x46140,clock) &&
+       (clock>>28)==1 && value(r,0x64000,buffer) && (buffer&(1U<<31))) {
+        const auto stable=[&] {
+            return io.read(0x45404)==power && io.read(0x46140)==clock &&
+                io.read(0x64000)==buffer && io.read(0x60400)==trans && io.read(0x60404)==ctl2;
+        };
+        if(stable()) {
+            add(0x6fa88);
+            if(!stable())r.status=ReadoutStatus::PowerChanged;
+        } else r.status=ReadoutStatus::PowerChanged;
+    }
     const auto after = add(0x45404);
     if (r.status == ReadoutStatus::Complete && after != power)
         r.status = ReadoutStatus::PowerChanged;
@@ -200,13 +223,6 @@ template<class IO> DisplayReadout readDisplay(IO &io, bool admitted) {
     DisplayReadout r;
     readDisplay(io,admitted,r);
     return r;
-}
-
-inline bool value(const DisplayReadout &r, uint32_t offset, uint32_t &out) {
-    if (r.count > sizeof(r.registers) / sizeof(r.registers[0])) return false;
-    for (uint32_t i=0; i<r.count; ++i)
-        if (r.registers[i].offset==offset) { out=r.registers[i].value; return out!=UINT32_MAX; }
-    return false;
 }
 
 // Linux intel_display_regs.h: TRANS_DDI_FUNC_CTL2 bit 3 is CMTG_SECONDARY_MODE
@@ -306,6 +322,15 @@ template<class IO> bool dpSourceUnchanged(IO &io,const DisplayReadout &r,unsigne
         if(!io.readable(reg))return false;
         if(reg==Display13Power::AUX)expected|=addedAUXRequest;
         if(io.read(reg)!=expected)return false;
+    }
+    uint32_t cmtg=0;
+    if(value(r,0x6fa88,cmtg)) {
+        uint32_t power=0,clock=0,buffer=0;
+        if(!value(r,0x45404,power) || !value(r,0x46140,clock) || !value(r,0x64000,buffer))return false;
+        const auto stable=[&] {
+            return io.read(0x45404)==power && io.read(0x46140)==clock && io.read(0x64000)==buffer;
+        };
+        if(!io.readable(0x6fa88) || !stable() || io.read(0x6fa88)!=cmtg || !stable())return false;
     }
     return true;
 }

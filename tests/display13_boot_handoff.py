@@ -330,12 +330,16 @@ void restartPanel(Fixture &f,Map &map,unsigned ddi) {
  // other CTL2 value still is. CMTG without the adopted secondary mode is
  // another owner and is never released. The adopted state remains accepted.
  for(auto reg:{0x60404U,0x6fa88U,0x78004U}) {
-  const auto saved=map.regs[reg],savedCTL2=map.regs[0x60404];
+  const auto saved=map.regs[reg],savedCTL2=map.regs[0x60404],savedCMTG=map.regs[0x6fa88];
   map.regs[reg]=reg==0x60404?(firmwareResidue?9:8):0x80000000U;
   if(reg==0x6fa88)map.regs[0x60404]=0;
   assert(XE::wrapDisplay13PortTraining(f.port,nullptr)==kIOReturnNotReady);
   assert(!dscReads && !dscWrites && !trains && c.bootPanelDSCCheckPending);
   assert(map.regs[reg]==(reg==0x60404?(firmwareResidue?9U:8U):0x80000000U));
+  // Another owner, including an active source DSC block (upstream bb7fad9's
+  // fault 12 protection), never authorizes releasing the adopted CMTG.
+  assert(!c.bootCMTGReleased);
+  if(reg==0x78004)assert(map.regs[0x60404]==savedCTL2 && map.regs[0x6fa88]==savedCMTG);
   map.regs[reg]=saved;map.regs[0x60404]=savedCTL2;
  }
  // Native DSC owns compressed training. It must neither consume the plain
@@ -357,6 +361,11 @@ void restartPanel(Fixture &f,Map &map,unsigned ddi) {
   assert(!dscWrites && !trains && c.bootPanelDSCCheckPending);
   downstream=false;
  }
+ // Upstream bb7fad9 retains a qualified firmware CMTG and refuses DSC writes
+ // while it runs. This fork releases it once transcoder A is stopped (see
+ // releaseBootCMTG), so that retained-state block does not apply here. Its
+ // protections remain above: an unidentified sink is never discharged, and
+ // an active source DSC block never authorizes the release.
  if(donor)nativePutDDI(f.port);
  const auto lightUp=[&] {
   lightStages.clear();
@@ -451,7 +460,10 @@ int main(int argc,char **argv){
   // The residue replay covers fastset and both stopped DSC paths in the
   // CPU model; native replay of the residue is not claimed here.
   if(residue && (donor || (fault!=0 && fault!=12)))continue;
-  stoppedSink=sink;firmwareResidue=residue;
+  // Upstream bb7fad9's fault 12 input carries the same firmware CMTG pair on
+  // DDI A, so it is a residue case here; native replay of it is not claimed.
+  const bool cmtgInput=!ddi && fault==12 && !donor;
+  stoppedSink=sink;firmwareResidue=residue || cmtgInput;
   objectRefs.clear();objectSizes.clear();realDisable=nullptr;
   Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20,true);
   auto &c=display13FBPower;c.bridge.~NativeBridge();new(&c.bridge)Display13Power::NativeBridge;
@@ -464,6 +476,9 @@ int main(int argc,char **argv){
   map.regs[0x45444]=1U<<(2*ddi);map.regs[0x42000]=0x8e380000;
   map.regs[0x60400]=0x82030006|((ddi+1)<<27);map.regs[0x70008]=0xc0000000;
   map.regs[0x64000+ddi*0x100]=0x80000006;map.regs[0x46140]=(ddi+1)<<28;
+  if(cmtgInput) {
+   map.regs[0x60404]=8;map.regs[0x6fa88]=0x80800000;
+  }
   map.regs[0x60540]=0x80040300;map.regs[0x60030]=0x7e300000;
   map.regs[0x60034]=map.regs[0x60044]=0x800000;map.regs[0x60040]=0x400000;
   map.regs[0x46010]=0xcc000000;map.regs[0x164284]=(0x4000U<<10)|0x151;
@@ -493,7 +508,7 @@ int main(int argc,char **argv){
   if(valid){
    assert(c.mainLink[ddi].owner==reinterpret_cast<uintptr_t>(f.port)&&!c.mainLink[ddi].bootPending);
    assert(c.bridge.bootPath==reinterpret_cast<uintptr_t>(f.path)&&objectRefs[f.port]==1);
-   assert(c.bootPanelCTL2==(residue?8U:0U) && map.regs[0x60404]==(residue?8U:0U));
+   assert(c.bootPanelCTL2==(firmwareResidue?8U:0U) && map.regs[0x60404]==(firmwareResidue?8U:0U));
    if(fault==7){
     // Same GPU address, native setupPlane staged a tiled primary. The mode
     // consumer retires the firmware claim before the pending plane is armed.
