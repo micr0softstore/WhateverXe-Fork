@@ -13,7 +13,7 @@ binding=fn('static TGLFBBinding::Readout adlnInspectPathBinding(')
 native=(r/'tests/tgl_fb_binding.cpp').read_text().split('int main()')[0].replace('port[0x580]','port[0x700]')
 code=(r/'tests/display13_sst_fixture.cpp').read_text().split('int main(')[0]
 code=code.replace('// NATIVE_OBJECTS',native).replace('// BINDING',binding)
-code=code.replace('struct Context {','struct Context { bool bootPanelDSCCheckPending=false;')
+code=code.replace('struct Context {','struct Context { bool bootPanelDSCCheckPending=false;uint32_t bootPanelCTL2=0;bool bootCMTGReleased=false;')
 lease=re.search(r'\tstruct TGLTrainingLease \{.*?\n\t\};',h,re.S).group()
 code=code.replace('struct XE {','''struct XE {
  LEASE

@@ -48,6 +48,8 @@ base=base.replace('struct Context {','''struct Context {
  IOWorkLoop *workLoop=nullptr;AlderLakeN::DisplayReadout displayScratch;Display13FBMemory::Readout firmwarePlane;
  bool bootPanel=true;struct {unsigned refKHz=24000;}clock;
  bool bootPanelDSCCheckPending=false;
+ uint32_t bootPanelCTL2=0;
+ bool bootCMTGReleased=false;
  Display13Transcoder::Bindings transcoders;
  XELP::DSI::Readout bootDSI;
  struct {bool destroyingPath=false;IOService *memoryFramebuffer=nullptr;Display13FBMemory::Readout memory;} pipe[3];
@@ -134,6 +136,8 @@ bool nativeDSCWriteFails=false;
 enum Stage { PanelOn, Clocks, Training, Plane, Scaler, Pipe, Brightness };
 std::vector<Stage> lightStages;
 bool replayCleanup=false;
+// Firmware left the undefined TRANS_DDI_FUNC_CTL2 bit 3 on the boot eDP source.
+bool firmwareResidue=false;
 void *reconstructionPort=nullptr;
 #include "display13_reconstruction_fixture.hpp"
 uint8_t *donor=nullptr,*accelerator=nullptr;
@@ -322,11 +326,17 @@ void restartPanel(Fixture &f,Map &map,unsigned ddi) {
   assert(!XE::wrapDisplay13DisablePort(f.port) && !objectRefs.count(f.port));
  }
  // A previous owner may leave DSC or CMTG active even with the pipe off.
+ // Without a boot residue, bit 3 alone is such an owner; with one, any
+ // other CTL2 value still is. CMTG without the adopted secondary mode is
+ // another owner and is never released. The adopted state remains accepted.
  for(auto reg:{0x60404U,0x6fa88U,0x78004U}) {
-  map.regs[reg]=reg==0x60404?8:0x80000000U;
+  const auto saved=map.regs[reg],savedCTL2=map.regs[0x60404];
+  map.regs[reg]=reg==0x60404?(firmwareResidue?9:8):0x80000000U;
+  if(reg==0x6fa88)map.regs[0x60404]=0;
   assert(XE::wrapDisplay13PortTraining(f.port,nullptr)==kIOReturnNotReady);
   assert(!dscReads && !dscWrites && !trains && c.bootPanelDSCCheckPending);
-  map.regs[reg]=0;
+  assert(map.regs[reg]==(reg==0x60404?(firmwareResidue?9U:8U):0x80000000U));
+  map.regs[reg]=saved;map.regs[0x60404]=savedCTL2;
  }
  // Native DSC owns compressed training. It must neither consume the plain
  // duty nor run WEX DSC-off reads/writes, even with unreadable capability.
@@ -400,6 +410,9 @@ void restartPanel(Fixture &f,Map &map,unsigned ddi) {
   nativeGetDDI(f.port);
  } else assert(!XE::wrapDisplay13DisablePort(f.port));
  assert(!c.mainLink[ddi].owner && !objectRefs.count(f.port));
+ // The stopped DSC check released the adopted CMTG state, CTL2 bit first.
+ if(firmwareResidue)assert(!map.regs[0x60404] && map.regs[0x6fa88]==0x00800000U && !c.bootPanelCTL2 && c.bootCMTGReleased);
+ else assert(!map.regs[0x6fa88] && !c.bootCMTGReleased);
  restarting=false;
 }
 unsigned noMode(void*,int,void*,void*){return 1;}
@@ -433,14 +446,18 @@ int main(int argc,char **argv){
   redirect(accelerator,0x7ef0f,0x300000,reinterpret_cast<uintptr_t>(strncmp));
  }
  for(fault=0;fault<=21;++fault)for(unsigned ddi:{0U,1U})for(unsigned mode:{0U,1U,3U,4U})for(bool foreign:{false,true})
- for(auto sink:{Supported,Unsupported,Legacy,AlreadyOff}) {
+ for(auto sink:{Supported,Unsupported,Legacy,AlreadyOff}) for(bool residue:{false,true}) {
   if(sink!=Supported && fault!=12 && fault!=0)continue;
-  stoppedSink=sink;
+  // The residue replay covers fastset and both stopped DSC paths in the
+  // CPU model; native replay of the residue is not claimed here.
+  if(residue && (donor || (fault!=0 && fault!=12)))continue;
+  stoppedSink=sink;firmwareResidue=residue;
   objectRefs.clear();objectSizes.clear();realDisable=nullptr;
   Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20,true);
   auto &c=display13FBPower;c.bridge.~NativeBridge();new(&c.bridge)Display13Power::NativeBridge;
-  c.bootPanelDSCCheckPending=false;
-  map.regs[0x45404]=0xfc0f;
+  c.bootPanelDSCCheckPending=false;c.bootPanelCTL2=0;c.bootCMTGReleased=false;
+  // Firmware runs eDP transcoder A as the CMTG secondary with CMTG A enabled.
+  map.regs[0x45404]=0xfc0f;map.regs[0x60404]=residue?8:0;map.regs[0x6fa88]=residue?0x80800000U:0;
   // For the error-unwind replay, begin() owns the DDI well before capture.
   // The remaining handoff cases retain the pre-existing firmware requests.
   map.regs[0x45454]=donor && (fault!=0 && fault!=8) ? 0 : 15;
@@ -476,6 +493,7 @@ int main(int argc,char **argv){
   if(valid){
    assert(c.mainLink[ddi].owner==reinterpret_cast<uintptr_t>(f.port)&&!c.mainLink[ddi].bootPending);
    assert(c.bridge.bootPath==reinterpret_cast<uintptr_t>(f.path)&&objectRefs[f.port]==1);
+   assert(c.bootPanelCTL2==(residue?8U:0U) && map.regs[0x60404]==(residue?8U:0U));
    if(fault==7){
     // Same GPU address, native setupPlane staged a tiled primary. The mode
     // consumer retires the firmware claim before the pending plane is armed.

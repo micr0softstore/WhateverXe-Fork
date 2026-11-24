@@ -209,6 +209,37 @@ inline bool value(const DisplayReadout &r, uint32_t offset, uint32_t &out) {
     return false;
 }
 
+// Linux intel_display_regs.h: TRANS_DDI_FUNC_CTL2 bit 3 is CMTG_SECONDARY_MODE
+// (port sync is bit 4 plus select bits 2:0). Mobile Display13 GOP drives an
+// SST eDP transcoder A as the CMTG secondary. Admit exactly that bit on the
+// internal panel source; it is never written during adoption and drift is refused.
+constexpr uint32_t PanelCTL2Residue=1U<<3; // CMTG_SECONDARY_MODE
+inline bool sourceCTL2(uint32_t ctl2,bool panel) {return !ctl2 || (panel && ctl2==PanelCTL2Residue);}
+// After a native stop, the bit is accepted only if firmware's adopted boot
+// source carried it; any other value is an active previous owner.
+inline bool stoppedCTL2(uint32_t ctl2,uint32_t bootResidue) {
+    return !ctl2 || (bootResidue==PanelCTL2Residue && ctl2==bootResidue);
+}
+// Linux intel_cmtg_regs.h: TRANS_CMTG_CTL(A)=0x6FA88, CMTG_ENABLE bit 31.
+// intel_cmtg_disable_all(): clear CMTG_SECONDARY_MODE, then CMTG_ENABLE.
+// CMTG_CLK_SEL exists only from display version 14, so Display13 has none.
+// Caller proves transcoder A, its pipe, DP_TP and DDI buffer are stopped.
+constexpr uint32_t CMTGControlA=0x6FA88,CMTGEnable=1U<<31;
+// Linux programs CMTG_SECONDARY_MODE only on display version 35
+// (intel_cmtg_is_allowed); earlier versions only clear firmware's bit. After the
+// boot CMTG is released, a native CTL2 write that restores the bit while CMTG A
+// is disabled would leave transcoder A waiting on a stopped primary. Strip
+// only that bit; every other CTL2 field passes through unchanged.
+inline uint32_t releasedCTL2Write(uint32_t value,uint32_t cmtg) {
+    return cmtg!=UINT32_MAX && !(cmtg&CMTGEnable) ? value&~PanelCTL2Residue : value;
+}
+template<class IO> bool releaseBootCMTG(IO &io) {
+    const auto ctl2=io.read(0x60404),cmtg=io.read(CMTGControlA);
+    if(ctl2!=PanelCTL2Residue || !(cmtg&CMTGEnable) || cmtg==UINT32_MAX)return false;
+    io.write(0x60404,ctl2&~PanelCTL2Residue);
+    io.write(CMTGControlA,cmtg&~CMTGEnable);
+    return !io.read(0x60404) && !(io.read(CMTGControlA)&CMTGEnable);
+}
 // Source-side certificate for an already-running, uncompressed external SST
 // GOP. This does not prove sink DPCD state, PLL rate or native AUX ownership.
 inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const Display13TC::Boot *tc=nullptr,bool panel=false) {
@@ -240,7 +271,7 @@ inline bool dpSource(const DisplayReadout &boot,unsigned pipe,unsigned ddi,const
     // preserve it and include it in the unchanged-source check, never clear it
     // on an enabled transcoder or infer an MST transport from that bit alone.
     return (trans&0xFF000000U)==(0x82000000U|((ddi+1)<<27)) && XELPGeometry::rgbLinkDepth(trans) &&
-        !(trans&((1U<<15)|(1U<<9))) && !ctl2 &&
+        !(trans&((1U<<15)|(1U<<9))) && sourceCTL2(ctl2,panel) &&
         (lanes==1 || lanes==2 || lanes==4) && ((buf>>1)&7)==lanes-1 &&
         (buf&(typeC && tc->ownershipOptional?0x80000080U:0x800000C0U))==
             (typeC && !tc->ownershipOptional?0x80000040U:0x80000000U) &&

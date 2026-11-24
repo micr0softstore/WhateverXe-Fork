@@ -76,6 +76,42 @@ int main() {
         assert(r.status==LinearStatus::Success && dpSourceUnchanged(io,boot,pipe,ddi,0,nullptr,true));
         io.regs[0x60540+0x1000*pipe]^=64;assert(!dpSourceUnchanged(io,boot,pipe,ddi,0,nullptr,true));
     }
+    // TRANS_DDI_FUNC_CTL2: Linux v6.12 port sync is bit 4 plus select bits 2:0.
+    // Only bit 3 (CMTG_SECONDARY_MODE) is admitted, and only for the internal
+    // panel. Linear setup never writes it, and drift in either direction is refused.
+    for(unsigned ddi=0;ddi<2;++ddi) {
+        auto io=firmware(0,ddi,2,true);io.regs[0x60404]=8;auto boot=readDisplay(io,true);LinearPlan plan;
+        assert(dpSource(boot,0,ddi,nullptr,true) && !dpSource(boot,0,ddi));
+        assert(linearPlan(boot,plan,ddi,GOPProtocol::EDP)==LinearStatus::Ready);
+        assert(linearPlan(boot,plan,ddi,GOPProtocol::DP)==LinearStatus::InvalidDPSource);
+        auto r=reinitializeLinear(io,boot,true,ddi,GOPProtocol::EDP);
+        assert(r.status==LinearStatus::Success && io.regs[0x60404]==8);
+        for(auto w:io.writes)assert(w.offset!=0x60404);
+        assert(dpSourceUnchanged(io,boot,0,ddi,0,nullptr,true));
+        io.regs[0x60404]=0;assert(!dpSourceUnchanged(io,boot,0,ddi,0,nullptr,true));
+        for(uint32_t other:{1U,4U,7U,9U,0x10U,0x18U,0x80000000U}) {
+            auto bad=firmware(0,ddi,2,true);bad.regs[0x60404]=other;
+            auto rb=reinitializeLinear(bad,readDisplay(bad,true),true,ddi,GOPProtocol::EDP);
+            assert(rb.status==LinearStatus::InvalidDPSource && bad.writes.empty());
+        }
+    }
+    assert(stoppedCTL2(0,0) && stoppedCTL2(0,8) && stoppedCTL2(8,8));
+    // Native writes restoring CMTG_SECONDARY_MODE lose only that bit while CMTG A is off.
+    assert(releasedCTL2Write(8,0)==0 && releasedCTL2Write(8,0x00800000)==0 && releasedCTL2Write(0x18,0)==0x10);
+    assert(releasedCTL2Write(8,0x80000000)==8 && releasedCTL2Write(8,UINT32_MAX)==8 && releasedCTL2Write(0x17,0)==0x17);
+    // Linux intel_cmtg_disable_all(): clear CMTG_SECONDARY_MODE, then CMTG_ENABLE.
+    // Only the exact adopted firmware state is released; CMTG_STATE is read-only here.
+    {
+        IO io;io.regs[0x60404]=8;io.regs[0x6FA88]=0x80800000;
+        assert(releaseBootCMTG(io) && io.writes.size()==2);
+        assert(io.writes[0].offset==0x60404 && io.writes[0].value==0);
+        assert(io.writes[1].offset==0x6FA88 && io.writes[1].value==0x00800000);
+        for(auto state:{std::pair<uint32_t,uint32_t>{0,0x80800000},{9,0x80800000},{0x18,0x80000000},{8,0x00800000},{8,0},{8,UINT32_MAX}}) {
+            IO other;other.regs[0x60404]=state.first;other.regs[0x6FA88]=state.second;
+            assert(!releaseBootCMTG(other) && other.writes.empty());
+        }
+    }
+    assert(!stoppedCTL2(8,0) && !stoppedCTL2(0x10,8) && !stoppedCTL2(9,8) && !stoppedCTL2(1,1) && !stoppedCTL2(0x18,0x18));
     // Intel TRANS_DDI_BPC: 8/10/6/12 are 0/1/2/3. 4..7 are reserved.
     // This is the link format, independent of the four-byte RGB8 plane.
     for(unsigned depth:{4U,5U,6U,7U}) {

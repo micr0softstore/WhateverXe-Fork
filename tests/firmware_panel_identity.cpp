@@ -54,6 +54,23 @@ int main(){
   auto bad=f;bad.vbt[f.data+36]=0;assert(!parseInput(bad).panel.valid);
   if(ptr)for(unsigned off:{0U,1U,3U,6U,7U,9U,10U,144U}){bad=f;bad.vbt[f.ptr+off]^=1;assert(!parseInput(bad).panel.valid);}
   for(size_t n=0;n<f.vbt.size();++n)assert(!parse(f.vbt.data(),n,Family::AlderLakeP).valid());
+  // Linux v6.12 get_panel_type(): VBT 0xff with a valid EDID identity that the
+  // well-formed table does not list selects fallback type 0, even though the
+  // sixteen profiles diverge. Expected values come from the fixture's profile 0.
+  auto unlisted=f;unlisted.op[0x1c0c+2]^=0x80;unlisted.edidChecksum();
+  auto fallback=parseInput(unlisted);
+  assert(fallback.panel.valid && fallback.panel.type==0 && fallback.panel.ddi==0 && fallback.panel.pwmHz==200);
+  for(unsigned i=0;i<5;++i)assert(fallback.panel.delays[i]==10+i);
+  assert(PanelPower::nativePPS0(fallback,Family::AlderLakeP));
+  auto fallbackWiring=display13Fixed(fallback,0x7b,Family::AlderLakeP);
+  assert(fallbackWiring.panel==1 && fallbackWiring.hdmi==2 && fallbackWiring.ddc[1]==2);
+  // An explicit index still wins over the fallback.
+  auto unlistedExplicit=unlisted;unlistedExplicit.vbt[f.options]=4;assert(parseInput(unlistedExplicit).panel.type==4);
+  // The fallback never applies without a validated identity and table.
+  bad=unlisted;bad.op[0x1c04+127]^=1;assert(!parseInput(bad).panel.valid);
+  bad=unlisted;bad.vbt[f.data+36]=0;assert(!parseInput(bad).panel.valid);
+  if(ptr)for(unsigned off:{0U,1U,3U,6U,7U,9U,10U,144U}){bad=unlisted;bad.vbt[f.ptr+off]^=1;assert(!parseInput(bad).panel.valid);}
+  if(!ptr){bad=unlisted;auto second=bad.block(42,66*16);memcpy(bad.vbt.data()+second,bad.vbt.data()+f.data,66*16);bad.finish();assert(!parseInput(bad).panel.valid);}
  }
  puts("PASS automatic EDID panel identity, explicit/generated pointers, equivalent facts, duplicate records and PPS/wiring consumers");
 }

@@ -4739,6 +4739,8 @@ struct Display13FBPowerContext {
     // firmware link's fastset eligibility. Only a stopped plain-link check
     // consumes it; teardown, unreadable state and native DSC training do not.
     bool bootPanelDSCCheckPending {};
+    uint32_t bootPanelCTL2 {}; // Adopted firmware CTL2 residue on boot pipe A.
+    bool bootCMTGReleased {}; // Adopted firmware CMTG A was released; never re-enabled.
     Display13FBMemory::Readout firmwarePlane; // Complete only while the original slot is eligible.
     bool bootDP {}; // Board protocol captured with the protected boot reference.
     Display13TC::DPRetainedLink tcDPLink[4];
@@ -7725,7 +7727,9 @@ bool XE::display13BootPanelDSCOff(void *port,unsigned ddi) {
  using Display13FBMemory::field;
  const auto pipe=field<uint32_t>(path,0x3640);
  if(pipe>=3)return false;
- const auto stopped=[&] {
+ // allowCMTG admits only the adopted firmware CMTG secondary state, so it
+ // can be released once everything else on transcoder A is proven stopped.
+ const auto stopped=[&](bool allowCMTG=false) {
   Display13FBPowerIO power{c.map};
   if(!c.bootPanelDSCCheckPending || ddi!=c.bridge.bootPort || !display13SSTPort(port) ||
      !display13AUXReady(port,false) || field<void *>(path,0x3648)!=port ||
@@ -7733,11 +7737,19 @@ bool XE::display13BootPanelDSCOff(void *port,unsigned ddi) {
   Display13FBSSTIO io{c.map};
   const auto bank=0x1000*pipe,dss=0x78000+0x200*pipe;
   return !(io.read(0x70008+bank)&0xc0000000U) && !(io.read(0x60400+bank)&0x80000000U) &&
-   !io.read(0x60404+bank) && !(io.read(0x60540+bank)&0x80000000U) &&
+   AlderLakeN::stoppedCTL2(io.read(0x60404+bank),pipe==0?c.bootPanelCTL2:0) && !(io.read(0x60540+bank)&0x80000000U) &&
    !(io.read(0x64000+0x100*ddi)&0x80000000U) &&
-   !(io.read(0x6fa88)&0x80000000U) && !(io.read(dss)&0xf0300000U) && !(io.read(dss+4)&0x80008000U);
+   (allowCMTG || !(io.read(0x6fa88)&0x80000000U)) && !(io.read(dss)&0xf0300000U) && !(io.read(dss+4)&0x80008000U);
  };
- IOLockLock(c.lock);const bool ready=stopped();IOLockUnlock(c.lock);
+ IOLockLock(c.lock);bool ready=stopped();
+ bool cmtgReleased=false;
+ if(!ready && pipe==0 && c.bootPanelCTL2==AlderLakeN::PanelCTL2Residue && stopped(true)) {
+  Display13FBSSTIO io{c.map};
+  cmtgReleased=AlderLakeN::releaseBootCMTG(io);
+  if(cmtgReleased){c.bootPanelCTL2=0;__atomic_store_n(&c.bootCMTGReleased,true,__ATOMIC_RELEASE);}
+  ready=stopped();
+ }
+ IOLockUnlock(c.lock);
  bool complete=false;
  if(ready) {
   // Link retention may have failed before any receiver observation. Do
@@ -8297,6 +8309,13 @@ void XE::wrapAlderLakeNGamma10(void *path,void *transaction,uint32_t control) {
 
 void XE::wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value) {
     if(display13DeferClock(access,reg,value,reinterpret_cast<uintptr_t>(__builtin_return_address(0))))return;
+    // Native FB restores firmware's TRANS_DDI_FUNC_CTL2_A including
+    // CMTG_SECONDARY_MODE after WEX released the boot CMTG; see releasedCTL2Write.
+    if(reg==0x60404 && (value&AlderLakeN::PanelCTL2Residue) && access && access==display13FBPower.access &&
+       display13FBPower.map && __atomic_load_n(&display13FBPower.bootCMTGReleased,__ATOMIC_ACQUIRE)) {
+        const auto cmtg=*reinterpret_cast<volatile uint32_t *>(display13FBPower.map->getVirtualAddress()+AlderLakeN::CMTGControlA);
+        value=AlderLakeN::releasedCTL2Write(value,cmtg);
+    }
     // DISPLAY13_COMBO_FRACTION: qualified nominal writer, physical reference,
     // retained controller/manager. No MMIO or other port's PLL inference.
     if(callbackXE->display13FramebufferRequested && callbackXE->xeProfile.display==XELP::Display::XeLPD &&
@@ -8851,7 +8870,12 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                             c.firmwareLink=port;
                             // Adoption owns the next plain-link DSC check, even
                             // if source/sink state disappears before comparison.
-                            if(c.bootPanel && ddi<2)c.bootPanelDSCCheckPending=true;
+                            if(c.bootPanel && ddi<2) {
+                                c.bootPanelDSCCheckPending=true;
+                                uint32_t ctl2=0;
+                                c.bootPanelCTL2=AlderLakeN::value(c.displayScratch,0x60404,ctl2) &&
+                                    ctl2==AlderLakeN::PanelCTL2Residue ? ctl2 : 0;
+                            }
                         }
                     }
                 }

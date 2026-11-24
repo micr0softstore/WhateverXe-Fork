@@ -104,8 +104,11 @@ inline const uint8_t *panelEDID(const void *data,size_t size) {
 // BDB 41 offsets are relative to the BDB; BDB 42 stores FP/DTD/PNP records.
 // Only identity is consumed here, never the firmware mode timing. Validate the
 // complete pointer layout, including the historical six-byte FP size hole.
+// layout reports a completely validated 16-entry table, distinguishing a
+// well-formed table that lists no matching identity from malformed records.
 inline uint16_t panelMatches(const uint8_t *b,const uint8_t *ptr,size_t ptrSize,
-                             const uint8_t *data,size_t dataSize,const uint8_t *edid) {
+                             const uint8_t *data,size_t dataSize,const uint8_t *edid,bool *layout=nullptr) {
+    if(layout)*layout=false;
     if(!edid || !data)return 0;
     size_t stride=66,fp=38;
     if(ptr) {
@@ -131,6 +134,7 @@ inline uint16_t panelMatches(const uint8_t *b,const uint8_t *ptr,size_t ptrSize,
         if(!memcmp(id,edid+8,10))exact|=1U<<n;
         else if(!memcmp(id,edid+8,8) && !u16(id+8))undated|=1U<<n;
     }
+    if(layout)*layout=true;
     return exact?exact:undated;
 }
 inline bool samePanelFacts(const Ports::Panel &a,const Ports::Panel &b) {
@@ -179,8 +183,15 @@ inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports,c
     // No blind profile-zero fallback. Missing identity is usable only if all
     // profiles agree on every fact consumed by WEX. Ambiguous identity follows
     // the same equivalence rule; UINT32_MAX reports that no index was selected.
+    bool layout=false;
     uint16_t candidates=requested<16?uint16_t(1U<<requested):
-        identityDuplicate?0:panelMatches(b,ptr,ptrSize,data,dataSize,identity);
+        identityDuplicate?0:panelMatches(b,ptr,ptrSize,data,dataSize,identity,&layout);
+    // Linux v6.12 intel_bios.c get_panel_type(): when the VBT requests PNP
+    // selection and a valid EDID identity is absent from a well-formed table,
+    // i915 uses fallback panel type 0. Admit only that case: a missing or
+    // malformed EDID, malformed table or duplicate identity block still
+    // requires every profile to agree.
+    if(!candidates && requested==0xff && layout)candidates=1;
     if(!candidates)candidates=0xffff;
     bool found=false;unsigned count=0;
     for(unsigned type=0;type<16;++type)if(candidates&(1U<<type)) {
